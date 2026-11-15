@@ -1,0 +1,23 @@
+services:
+  heatmeter:
+    build: .
+    image: heatmeter-utc:1.0.0
+    container_name: heatmeter-api
+    ports:
+      - "8000:8000"
+    environment:
+      # 容器内 SQLite 路径，匹配命名卷挂载
+      HEATMETER_DB: /data/heatmeter.db
+      TZ: America/New_York
+    volumes:
+      - heatmeter-data:/data
+    restart: unless-stopped
+    healthcheck:
+      test: ["CMD", "python", "-c", "import urllib.request,sys; sys.exit(0 if urllib.request.urlopen('http://127.0.0.1:8000/healthz', timeout=4).status==200 else 1)"]
+      interval: 30s
+      timeout: 5s
+      retries: 3
+      start_period: 10s
+
+volumes:
+  heatmeter-data:

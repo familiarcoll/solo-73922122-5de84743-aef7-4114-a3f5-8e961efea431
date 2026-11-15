@@ -1,7 +1,7 @@
 services:
   heatmeter:
     build: .
-    image: heatmeter-utc:1.0.0
+    image: heatmeter-utc:1.1.0
     container_name: heatmeter-api
     ports:
       - "8000:8000"

@@ -12,7 +12,7 @@ from __future__ import annotations
 
 import re
 from contextlib import asynccontextmanager
-from datetime import date
+from datetime import date, timedelta
 from typing import Any
 
 from fastapi import FastAPI, File, HTTPException, Path, UploadFile, status
@@ -20,7 +20,22 @@ from fastapi.responses import JSONResponse
 from pydantic import BaseModel, Field
 
 from .csvparse import CsvValidationError, parse_readings_csv
-from .db import connect, get_published_batch, init_db, list_published_dates, publish_batch
+from .db import (
+    connect,
+    get_published_batch,
+    immediate_transaction,
+    init_db,
+    insert_batch_locked,
+    list_published_dates,
+)
+from .dedup import (
+    MIN_DISTINCT_READINGS,
+    MIN_MATCH_RUN,
+    MatchedRun,
+    current_day_readings,
+    detect_reupload,
+    previous_day_readings,
+)
 from .tzmap import BatchOutcome, RowStatus, solve_batch
 
 # 表号：字母数字与连字符，2–64 位，防止路径/注入类异常输入
@@ -38,6 +53,9 @@ _OUTCOME_CODE = {
     BatchOutcome.MULTIPLE_SOLUTIONS: "NO_UNIQUE_MAPPING_MULTIPLE_SOLUTIONS",
 }
 
+# 跨日重传（前一日读数换日期再传）拒绝码
+_DUPLICATE_CODE = "DUPLICATE_OF_PREVIOUS_DAY_BATCH"
+
 
 class ReadingOut(BaseModel):
     seq: int
@@ -45,6 +63,10 @@ class ReadingOut(BaseModel):
     utc_time: str = Field(description="映射后的 UTC 时间（带偏移 ISO 8601）")
     reading: float
     mapping: str = Field(description="normal=普通钟点；ambiguous=秋季回拨（已按整批唯一解定档）")
+    fold: int = Field(
+        default=0,
+        description="回拨档位：0=第一次经过（fold=0/普通钟点），1=回拨后第二次经过（fold=1）",
+    )
 
 
 class BatchResponse(BaseModel):
@@ -74,9 +96,11 @@ app = FastAPI(
     description=(
         "纽约本地时钟（America/New_York）分钟级读数 CSV 上传，"
         "按整批 UTC 严格递增约束求解唯一映射后入 SQLite。"
-        "春季缺口、无解、多解均拒绝且保留该日此前发布数据。"
+        "春季缺口、无解、多解均拒绝且保留该日此前发布数据；"
+        "唯一映射后再与同一表前一纽约本地日的已发布批次做跨日重传比对，"
+        "连续 5 条同钟点、同回拨档位且读数相等（含至少 3 个不同读数）即拒绝整批。"
     ),
-    version="1.0.0",
+    version="1.1.0",
     lifespan=lifespan,
 )
 
@@ -99,6 +123,7 @@ def _rejection_payload(
     reason: str,
     involved_seqs: list[int],
     retained: dict[str, Any] | None,
+    extra: dict[str, Any] | None = None,
 ) -> dict[str, Any]:
     detail: dict[str, Any] = {
         "error_code": code,
@@ -114,14 +139,24 @@ def _rejection_payload(
             "published_at": retained["published_at"],
             "row_count": retained["row_count"],
         }
+    if extra:
+        detail.update(extra)
     return {"detail": detail}
+
+
+class DuplicateRejected(Exception):
+    """锁内跨日比对命中重传：携带已构造好的拒绝载荷，事务须回滚。"""
+
+    def __init__(self, payload: dict[str, Any]):
+        super().__init__(payload["detail"]["error_code"])
+        self.payload = payload
 
 
 @app.post(
     "/meters/{meter_id}/dates/{local_date}/batches",
     response_model=BatchResponse,
     status_code=status.HTTP_200_OK,
-    summary="上传一日读数 CSV，映射唯一则整批发布（重传完整替换）",
+    summary="上传一日读数 CSV：UTC 唯一映射后做跨日重传比对，通过则整批发布（重传完整替换）",
 )
 async def upload_batch(
     meter_id: str = Path(..., description="热量表表号"),
@@ -171,10 +206,59 @@ async def upload_batch(
             ),
         )
 
-    # 4. 唯一解：单事务完整替换发布
+    # 4. 唯一解：在同一个 BEGIN IMMEDIATE 事务内完成
+    #    “取前日已发布批次 → 跨日重传比对 → 当日整批替换发布”。
+    #    持锁期间其他连接无法替换前日批次，比对与发布必然基于同一已提交版本。
+    previous_date = local_date - timedelta(days=1)
     conn = connect()
     try:
-        info = publish_batch(conn, meter_id, local_date, result.assigned)
+        with immediate_transaction(conn):
+            previous = get_published_batch(conn, meter_id, previous_date)
+            if previous is not None:
+                run: MatchedRun | None = detect_reupload(
+                    current_day_readings(result.assigned),
+                    previous_day_readings(previous["readings"]),
+                )
+                if run is not None:
+                    # 命中跨日重传：不写入任何数据，抛出后事务回滚，
+                    # 当日原已发布批次原样保留。
+                    retained_today = get_published_batch(
+                        conn, meter_id, local_date
+                    )
+                    payload = _rejection_payload(
+                        meter_id,
+                        local_date,
+                        _DUPLICATE_CODE,
+                        (
+                            f"与同一表前一纽约本地日 {previous_date.isoformat()} "
+                            f"的已发布批次（batch_id={previous['batch_id']}）存在 "
+                            f"{run.length} 条连续读数在相同本地钟点与回拨档位上"
+                            f"逐条相等，且含 {run.distinct_readings} 个不同读数"
+                            f"（阈值：连续≥{MIN_MATCH_RUN} 条、不同读数≥"
+                            f"{MIN_DISTINCT_READINGS} 个），判定为前日读数换日期"
+                            "重传，按规则拒绝整批"
+                        ),
+                        run.current_seqs,
+                        retained_today,
+                        extra={
+                            "previous_local_date": previous_date.isoformat(),
+                            "previous_batch_id": previous["batch_id"],
+                            "matched_run_length": run.length,
+                            "matched_distinct_readings": run.distinct_readings,
+                            "previous_involved_seqs": run.previous_seqs,
+                        },
+                    )
+                    raise DuplicateRejected(payload)
+
+            # 无前日批次，或比对未命中：单事务完整替换发布当日批次
+            info = insert_batch_locked(
+                conn, meter_id, local_date, result.assigned
+            )
+    except DuplicateRejected as exc:
+        return JSONResponse(
+            status_code=status.HTTP_422_UNPROCESSABLE_ENTITY,
+            content=exc.payload,
+        )
     finally:
         conn.close()
 
@@ -234,6 +318,7 @@ async def read_readings(
                 "utc_time": r["utc_time"],
                 "reading": r["reading"],
                 "mapping": r["row_status"],
+                "fold": r["fold"],
             }
             for r in batch["readings"]
         ],

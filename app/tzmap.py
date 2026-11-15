@@ -64,6 +64,9 @@ class AssignedRow:
     reading: float
     status: RowStatus
     utc_time: datetime
+    # 回拨档位：普通钟点固定 0；秋季回拨行等于候选下标，
+    # 0=第一次经过（EDT，fold=0），1=回拨后第二次经过（EST，fold=1）
+    fold: int
 
 
 @dataclass
@@ -228,6 +231,8 @@ def solve_batch(rows: list[RowInput]) -> BatchMappingResult:
                 reading=m.reading,
                 status=m.status,
                 utc_time=m.candidates_utc[c],
+                # 普通钟点只有一个候选（c=0）；回拨行 c 即 fold 档位
+                fold=c,
             )
         )
 
